@@ -51,28 +51,42 @@ chmod 700 "$DATA_DIR"
 
 echo
 grn "安装完成。"
-echo
+
 if [ -f "$DATA_DIR/config" ]; then
-    ylw "检测到已有配置："
-    sed 's/^/    /' "$DATA_DIR/config"
-    echo
-    echo "  当前回源域名："
-    "$BIN" list 2>/dev/null | sed 's/^/    /' || true
+    # 已初始化，直接进菜单（脚本化调用设 XB_NO_MENU=1 跳过）
+    if [ -z "${XB_NO_MENU:-}" ] && [ -r /dev/tty ] && [ -t 1 ]; then
+        sleep 1
+        "$BIN" < /dev/tty || true
+    else
+        echo
+        "$BIN" list 2>/dev/null | sed 's/^/  /' || true
+        echo
+        echo "  进菜单：$BIN"
+    fi
 else
-    echo "  下一步 —— 初始化（只需一次）："
     echo
-    echo "    $BIN init <后台路径>"
+    echo "  还没初始化，需要先指定 XBoard 后台路径。"
     echo
-    echo "  <后台路径> 是 XBoard 管理面板那段随机串。浏览器打开"
-    echo "    https://你的域名/xxxxxxxx"
-    echo "  里 xxxxxxxx 就是它。"
+    echo "  后台路径就是管理面板那段随机串，例如打开"
+    echo "    https://你的域名/a1b2c3d4"
+    echo "  里的 a1b2c3d4。"
+    echo
+    printf '  现在初始化吗？输入后台路径（留空跳过）: '
+    if [ -r /dev/tty ] && [ -t 1 ]; then
+        read -r adminPath < /dev/tty || adminPath=""
+    else
+        adminPath=""
+    fi
+    if [ -n "$adminPath" ]; then
+        "$BIN" init "$adminPath" || true
+        echo
+        if [ -z "${XB_NO_MENU:-}" ] && [ -r /dev/tty ] && [ -t 1 ]; then
+            "$BIN" < /dev/tty || true
+        fi
+    else
+        echo
+        echo "  稍后手动初始化："
+        echo "    $BIN init <后台路径>"
+    fi
 fi
-echo
-echo "  然后加回源域名："
-echo "    $BIN add newsub.example.com"
-echo
-echo "  管后台白名单："
-echo "    $BIN allow admin.example.com"
-echo "    $BIN deny  admin.example.com"
-echo "    $BIN allowlist"
 echo

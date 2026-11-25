@@ -46,6 +46,8 @@ ACL_CONF=$DATA_DIR/xboard-admin-acl.conf
 BACKUP_DIR=/root/xboard-domain-bak
 NGINX_BIN=/www/server/nginx/sbin/nginx
 
+B=$'\033[1m'; C=$'\033[36m'; N=$'\033[0m'; G=$'\033[32m'; Y=$'\033[33m'; D=$'\033[90m'
+
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -405,6 +407,165 @@ cmd_allowlist() {
     fi
 }
 
+# ---------------------------------------------------------------- 菜单
+
+# 把所有回源 vhost 的 server_name 摊平成 MENU_DOMAINS 数组
+menu_collect() {
+    local f hosts h
+    MENU_DOMAINS=()
+    while read -r f; do
+        [ -n "$f" ] || continue
+        hosts=$(grep -m1 -E '^[[:space:]]*server_name' "$f" | sed 's/.*server_name[[:space:]]*//; s/;.*//')
+        for h in $hosts; do
+            MENU_DOMAINS+=("$h")
+        done
+    done < <(xboard_vhosts)
+}
+
+# 序号或域名都接受，解析成域名
+menu_resolve() {
+    local in="$1"
+    if printf '%s' "$in" | grep -qE '^[0-9]+$'; then
+        if [ "$in" -ge 1 ] && [ "$in" -le "${#MENU_DOMAINS[@]}" ]; then
+            printf '%s' "${MENU_DOMAINS[$((in-1))]}"
+            return 0
+        fi
+        return 1
+    fi
+    valid_domain "$in" || return 1
+    printf '%s' "$in"
+}
+
+menu_show() {
+    local allowers i=0 n=0 h left right
+
+    allowers=$(grep -vE '^[[:space:]]*(#|$)' "$ACL_LIST" 2>/dev/null | tr -d ' \r')
+    menu_collect
+    n=${#MENU_DOMAINS[@]}
+
+    printf '\n%s  XBoard 域名管理%s   后台 /%s\n' "$B$C" "$N" "$ADMIN_PATH"
+    printf -- '---------------------------------------------\n'
+
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        # 左列
+        h="${MENU_DOMAINS[$i]}"
+        i=$((i+1))
+        left=$(printf '  %s%2d)%s %-26s' "$C" "$i" "$N" "$h")
+        printf '%s' "$left"
+        if printf '%s\n' "$allowers" | grep -qx "$h" 2>/dev/null; then
+            printf '%s放行%s' "$G" "$N"
+        else
+            printf '%s────%s' "$D" "$N"
+        fi
+
+        # 右列
+        if [ "$i" -lt "$n" ]; then
+            h="${MENU_DOMAINS[$i]}"
+            i=$((i+1))
+            printf '  %s%2d)%s %-26s' "$C" "$i" "$N" "$h"
+            if printf '%s\n' "$allowers" | grep -qx "$h" 2>/dev/null; then
+                printf '%s放行%s' "$G" "$N"
+            else
+                printf '%s────%s' "$D" "$N"
+            fi
+        fi
+        printf '\n'
+    done
+
+    if [ "$n" -eq 0 ]; then
+        printf '  %s(还没有回源域名，按 1 添加)%s\n' "$Y" "$N"
+    fi
+
+    printf -- '---------------------------------------------\n'
+    printf '  共 %d 个域名   %s放行%s = 可进后台   %s────%s = 禁止\n' \
+        "$n" "$G" "$N" "$D" "$N"
+
+    printf '\n  1) 添加回源域名      2) 删除回源域名\n'
+    printf '  3) 放行后台访问      4) 撤销后台访问\n'
+    printf '  5) 重新应用          0) 退出\n'
+    printf '\n%s选择 [0-5]:%s ' "$B" "$N"
+}
+
+menu_pause() {
+    printf '\n按回车继续...'
+    read -r _ || true
+}
+
+cmd_menu() {
+    local ch target ans
+
+    while :; do
+        clear 2>/dev/null || true
+        menu_show
+        read -r ch || break
+        echo
+
+        case "$ch" in
+            1)
+                printf '输入域名（可带证书目录名，空格分隔，留空取消）: '
+                read -r ans || ans=""
+                [ -n "$ans" ] || continue
+                # shellcheck disable=SC2086
+                cmd_add $ans
+                menu_pause
+                ;;
+            2)
+                printf '输入序号或域名: '
+                read -r ans || ans=""
+                [ -n "$ans" ] || continue
+                if target=$(menu_resolve "$ans"); then
+                    cmd_del "$target"
+                else
+                    red "序号或域名无效: $ans"
+                fi
+                menu_pause
+                ;;
+            3)
+                printf '输入序号或域名（空格分隔可多个）: '
+                read -r ans || ans=""
+                [ -n "$ans" ] || continue
+                local picked=""
+                for target in $ans; do
+                    if d=$(menu_resolve "$target"); then
+                        picked="$picked $d"
+                    else
+                        red "跳过无效: $target"
+                    fi
+                done
+                [ -n "$picked" ] && cmd_allow $picked
+                menu_pause
+                ;;
+            4)
+                printf '输入序号或域名（空格分隔可多个）: '
+                read -r ans || ans=""
+                [ -n "$ans" ] || continue
+                local drop=""
+                for target in $ans; do
+                    if d=$(menu_resolve "$target"); then
+                        drop="$drop $d"
+                    else
+                        red "跳过无效: $target"
+                    fi
+                done
+                [ -n "$drop" ] && cmd_deny $drop
+                menu_pause
+                ;;
+            5)
+                cmd_reload
+                menu_pause
+                ;;
+            0|q|quit|exit|"")
+                break
+                ;;
+            *)
+                red "无效选择: $ch"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 cmd_reload() {
     build_acl
     reload_nginx || exit 1
@@ -422,7 +583,15 @@ case "${1:-}" in
     deny)      shift; need_init; cmd_deny "$@" ;;
     allowlist|allowed) need_init; cmd_allowlist ;;
     reload)    need_init; cmd_reload ;;
-    *)
+    menu|"")
+        # curl | bash 时 stdin 是管道，切到控制终端才能交互
+        if [ ! -t 0 ] && [ -r /dev/tty ]; then
+            exec < /dev/tty
+        fi
+        need_init
+        cmd_menu
+        ;;
+    help|-h|--help)
         cat <<EOF
 xboard-domain —— XBoard CDN 回源域名与后台访问控制
 
