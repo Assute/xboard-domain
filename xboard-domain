@@ -1,0 +1,451 @@
+#!/bin/bash
+# ============================================================================
+#  xboard-domain —— XBoard CDN 回源域名与后台访问控制
+#
+#  解决什么问题
+#    XBoard 用 docker 跑在 127.0.0.1:7001，前面挂 CDN。回源走 80 到本机 nginx，
+#    nginx 靠 server_name 认域名。没配 vhost 的域名会落到 0.default.conf，
+#    返回 nginx 欢迎页——看起来像"打不开"，实际是没接住。
+#
+#    同时把管理后台限制到指定域名：后台路径在一个单独的 include 文件里
+#    做 Host 白名单，所有回源 vhost 共用，改一处全局生效。
+#
+#  用法
+#    xboard-domain init <后台路径> [上游]     初始化（只需一次）
+#    xboard-domain add <域名> [证书目录名]    添加回源域名
+#    xboard-domain del <域名>                 删除
+#    xboard-domain list                       列出回源域名与后台权限
+#    xboard-domain test <域名>                本机验证
+#    xboard-domain allow <域名>...            允许这些域名访问后台
+#    xboard-domain deny <域名>...             撤销
+#    xboard-domain allowlist                  列出可访问后台的域名
+#    xboard-domain reload                     重新生成 ACL 并 reload
+#
+#  CDN 面板怎么填
+#    回源地址   源站 IP
+#    回源端口   80
+#    回源协议   HTTP
+#    回源 Host   必须填域名本身，不能填 IP
+#
+#  数据结构
+#    /etc/xboard-domain/config            上游地址、后台路径
+#    /etc/xboard-domain/admin-allow.list   允许访问后台的域名
+#    <nginx>/xboard-admin-acl.conf         生成的 include，勿手改
+# ============================================================================
+set -u
+
+CONF_DIR=/www/server/panel/vhost/nginx
+CERT_DIR=/www/server/panel/vhost/cert
+LOG_DIR=/www/wwwlogs
+DATA_DIR=/etc/xboard-domain
+CONFIG=$DATA_DIR/config
+ACL_LIST=$DATA_DIR/admin-allow.list
+# ACL 不能放在 $CONF_DIR 下——那个目录被 nginx.conf 用 *.conf 整体 include，
+# 里面的 location 会被当成顶层指令报 "location directive is not allowed here"。
+ACL_CONF=$DATA_DIR/xboard-admin-acl.conf
+BACKUP_DIR=/root/xboard-domain-bak
+NGINX_BIN=/www/server/nginx/sbin/nginx
+
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+grn() { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+need_root() {
+    [ "$(id -u)" = "0" ] || { red "需要 root 权限"; exit 1; }
+}
+
+load_config() {
+    [ -f "$CONFIG" ] || return 1
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    [ -n "${UPSTREAM:-}" ] || UPSTREAM=127.0.0.1:7001
+    [ -n "${ADMIN_PATH:-}" ] || return 1
+    return 0
+}
+
+need_init() {
+    load_config || {
+        red "还没初始化，先跑："
+        echo "  $0 init <后台路径> [上游，默认 127.0.0.1:7001]"
+        echo
+        echo "后台路径就是 XBoard 管理面板那段随机字符串，例如浏览器里"
+        echo "   https://你的域名/a1b2c3d4"
+        echo "里的 a1b2c3d4。"
+        exit 1
+    }
+}
+
+valid_domain() {
+    printf '%s' "$1" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
+}
+
+# ---------------------------------------------------------------- ACL 生成
+
+build_acl() {
+    local domains re
+
+    domains=$(grep -vE '^[[:space:]]*(#|$)' "$ACL_LIST" 2>/dev/null | tr -d ' \r' | sort -u)
+
+    if [ -z "$domains" ]; then
+        re='(?!)'
+        ylw "白名单为空——所有域名都进不了后台"
+    else
+        re=$(printf '%s\n' "$domains" | sed 's/\./\\./g' | paste -sd'|' -)
+    fi
+
+    {
+        echo "# 由 xboard-domain 生成于 $(date '+%Y-%m-%d %H:%M:%S')，请勿手改"
+        echo "# 允许访问后台 /$ADMIN_PATH 的域名："
+        if [ -n "$domains" ]; then
+            printf '%s\n' "$domains" | sed 's/^/#   /'
+        else
+            echo "#   （空）"
+        fi
+        echo "location ^~ /$ADMIN_PATH {"
+        echo "    # 白名单外一律 404"
+        echo "    if (\$host !~ ^($re)\$) {"
+        echo "        return 404;"
+        echo "    }"
+        echo
+        echo "    proxy_pass http://$UPSTREAM;"
+        echo "    proxy_http_version 1.1;"
+        echo "    proxy_set_header Host              \$host;"
+        echo "    proxy_set_header X-Real-IP         \$remote_addr;"
+        echo "    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+        echo "    proxy_set_header X-Forwarded-Proto \$scheme;"
+        echo "    proxy_set_header Upgrade           \$http_upgrade;"
+        echo "    proxy_set_header Connection        \"upgrade\";"
+        echo "    proxy_connect_timeout 15s;"
+        echo "    proxy_send_timeout    300s;"
+        echo "    proxy_read_timeout    300s;"
+        echo "    proxy_buffering off;"
+        echo "}"
+    } > "$ACL_CONF"
+    chmod 644 "$ACL_CONF"
+}
+
+reload_nginx() {
+    if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+        red "nginx 语法检查失败"
+        "$NGINX_BIN" -t 2>&1 | sed 's/^/  /'
+        return 1
+    fi
+    "$NGINX_BIN" -s reload && grn "已 reload"
+}
+
+# 让某个 vhost 引用 ACL，并把内联的旧 404 块去掉
+wire_vhost() {
+    local f="$1"
+    local rel="include $ACL_CONF;"
+
+    grep -qF "$ACL_CONF" "$f" && return 0
+
+    # 删掉旧的内联 location ^~ /<ADMIN_PATH> { return 404; }
+    if grep -qE "location \^~ /$ADMIN_PATH" "$f"; then
+        python3 - "$f" "$ADMIN_PATH" <<'PY'
+import re, sys
+path, admin = sys.argv[1], sys.argv[2]
+s = open(path, encoding="utf-8").read()
+pat = re.compile(r"^[ \t]*#[^\n]*\n?[ \t]*location \^~ /" + re.escape(admin) + r"\s*\{[^}]*\}\n*", re.MULTILINE)
+s2 = pat.sub("", s, count=1)
+open(path, "w", encoding="utf-8", newline="\n").write(s2)
+PY
+    fi
+
+    # 在 location ^~ / { 之前插入 include
+    python3 - "$f" "$ACL_CONF" <<'PY'
+import re, sys
+path, acl = sys.argv[1], sys.argv[2]
+s = open(path, encoding="utf-8").read()
+m = re.search(r"^([ \t]*)location \^~ / \{", s, re.MULTILINE)
+if not m:
+    sys.exit("找不到 location ^~ / {")
+indent = m.group(1)
+block = indent + "include " + acl + ";\n\n"
+s = s[:m.start()] + block + s[m.start():]
+open(path, "w", encoding="utf-8", newline="\n").write(s)
+PY
+}
+
+xboard_vhosts() {
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$(basename "$f")" = "$(basename "$ACL_CONF")" ] && continue
+        grep -q "proxy_pass http://$UPSTREAM" "$f" 2>/dev/null && echo "$f"
+    done
+}
+
+# ---------------------------------------------------------------- 命令
+
+cmd_init() {
+    local admin="${1:-}" upstream="${2:-127.0.0.1:7001}"
+
+    [ -n "$admin" ] || { red "用法: $0 init <后台路径> [上游]"; exit 1; }
+    printf '%s' "$admin" | grep -qE '^[A-Za-z0-9_-]{4,64}$' \
+        || { red "后台路径只能是字母数字下划线短横，4-64 位"; exit 1; }
+
+    mkdir -p "$DATA_DIR"
+    chmod 755 "$DATA_DIR"
+    cat > "$CONFIG" <<EOF
+# xboard-domain 配置
+UPSTREAM=$upstream
+ADMIN_PATH=$admin
+EOF
+    chmod 600 "$CONFIG"
+    [ -f "$ACL_LIST" ] || : > "$ACL_LIST"
+    grn "配置已写入 $CONFIG"
+    echo "  上游      http://$upstream"
+    echo "  后台路径  /$admin"
+
+    UPSTREAM="$upstream"
+    ADMIN_PATH="$admin"
+    build_acl
+    echo "已生成 $ACL_CONF"
+
+    local n=0 f
+    while read -r f; do
+        [ -n "$f" ] || continue
+        wire_vhost "$f" && n=$((n+1))
+    done < <(xboard_vhosts)
+
+    echo "已接入 $n 个 vhost"
+    reload_nginx || exit 1
+}
+
+cmd_add() {
+    local domain="${1:-}" cert="${2:-}"
+    [ -n "$domain" ] || { red "用法: $0 add <域名> [证书目录名]"; exit 1; }
+    valid_domain "$domain" || { red "域名格式不对: $domain"; exit 1; }
+
+    local conf="$CONF_DIR/$domain.conf"
+    if [ -f "$conf" ]; then
+        ylw "已存在: $conf"
+        return 1
+    fi
+
+    local ssl_block
+    if [ -n "$cert" ]; then
+        [ -f "$CERT_DIR/$cert/fullchain.pem" ] \
+            || { red "证书不存在: $CERT_DIR/$cert/fullchain.pem"; ls -1 "$CERT_DIR" | sed 's/^/  /'; exit 1; }
+        ssl_block="    listen 443 ssl http2;
+    ssl_certificate     $CERT_DIR/$cert/fullchain.pem;
+    ssl_certificate_key $CERT_DIR/$cert/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;"
+    else
+        ssl_block="    # 只监听 80：CDN 回源用 HTTP 即可。
+    # 需要源站 443 时: $0 add $domain <证书目录名>"
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+
+    cat > "$conf" <<EOF
+# XBoard CDN 回源入口：$domain
+# 由 xboard-domain 生成于 $(date '+%Y-%m-%d %H:%M:%S')
+server {
+    listen 80;
+$ssl_block
+
+    server_name $domain;
+
+    access_log $LOG_DIR/$domain.log;
+    error_log  $LOG_DIR/$domain.error.log;
+
+    client_max_body_size 50m;
+
+    include $ACL_CONF;
+
+    location ^~ / {
+        proxy_pass http://$UPSTREAM;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    300s;
+        proxy_read_timeout    300s;
+        proxy_buffering off;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; }
+}
+EOF
+
+    echo "已生成 $conf"
+
+    if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+        red "语法检查失败，回滚"
+        "$NGINX_BIN" -t 2>&1 | sed 's/^/  /'
+        rm -f "$conf"
+        exit 1
+    fi
+    "$NGINX_BIN" -s reload && grn "已 reload"
+    sleep 1
+    cmd_test "$domain"
+
+    echo
+    ylw "CDN 面板填："
+    echo "  回源地址   源站 IP（本机）"
+    echo "  回源端口   80"
+    echo "  回源协议   HTTP"
+    echo "  回源 Host   $domain      ← 必须填域名，不能填 IP"
+}
+
+cmd_del() {
+    local domain="${1:-}"
+    [ -n "$domain" ] || { red "用法: $0 del <域名>"; exit 1; }
+    local conf="$CONF_DIR/$domain.conf"
+    [ -f "$conf" ] || { red "不存在: $conf"; exit 1; }
+
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$conf" "$BACKUP_DIR/$domain.conf.$(date +%Y%m%d_%H%M%S)"
+    rm -f "$conf"
+
+    if "$NGINX_BIN" -t >/dev/null 2>&1; then
+        "$NGINX_BIN" -s reload && grn "已删除 $domain"
+    else
+        red "reload 失败，恢复"
+        cp -a "$BACKUP_DIR/$domain.conf."* "$conf" 2>/dev/null
+        exit 1
+    fi
+}
+
+cmd_test() {
+    local domain="${1:-}"
+    [ -n "$domain" ] || { red "用法: $0 test <域名>"; exit 1; }
+    local a b
+    a=$(curl -s -o /dev/null -w '%{http_code}' -m 8 -H "Host: $domain" http://127.0.0.1/ 2>/dev/null)
+    b=$(curl -s -o /dev/null -w '%{http_code}' -m 8 -H "Host: $domain" "http://127.0.0.1/$ADMIN_PATH" 2>/dev/null)
+    printf '  %-30s /            -> %s\n' "$domain" "$a"
+    printf '  %-30s /%s -> %s\n' "$domain" "$ADMIN_PATH" "$b"
+}
+
+cmd_list() {
+    local allowers total=0 f hosts guard
+    allowers=$(grep -vE '^[[:space:]]*(#|$)' "$ACL_LIST" 2>/dev/null | tr -d ' \r' | sort -u)
+
+    printf '%-34s %s\n' "回源域名(vhost)" "后台"
+    printf -- '--------------------------------------------------------------------\n'
+    while read -r f; do
+        [ -n "$f" ] || continue
+        total=$((total+1))
+        hosts=$(grep -m1 -E '^[[:space:]]*server_name' "$f" | sed 's/.*server_name[[:space:]]*//; s/;.*//')
+        printf '%-34s %s\n' "$(basename "$f" .conf)" "$(grep -qF "$ACL_CONF" "$f" && echo 已接入 || echo 未接入)"
+        local h
+        for h in $hosts; do
+            if printf '%s\n' "$allowers" | grep -qx "$h"; then
+                printf '    %-30s 放行\n' "$h"
+            else
+                printf '    %-30s 禁止\n' "$h"
+            fi
+        done
+    done < <(xboard_vhosts)
+
+    echo
+    echo "  共 $total 个回源 vhost"
+    echo "  后台路径  /$ADMIN_PATH"
+    echo
+    echo "  可访问后台的域名："
+    if [ -z "$allowers" ]; then
+        echo "    （空，谁都不能进）"
+    else
+        printf '%s\n' "$allowers" | sed 's/^/    /'
+    fi
+}
+
+cmd_allow() {
+    [ $# -gt 0 ] || { red "用法: $0 allow <域名>..."; exit 1; }
+    local d
+    for d in "$@"; do
+        valid_domain "$d" || { red "格式不对: $d"; exit 1; }
+    done
+    touch "$ACL_LIST"
+    for d in "$@"; do
+        if grep -qx "$d" "$ACL_LIST" 2>/dev/null; then
+            ylw "已在白名单: $d"
+        else
+            echo "$d" >> "$ACL_LIST"
+            grn "放行: $d"
+        fi
+    done
+    sort -u -o "$ACL_LIST" "$ACL_LIST"
+    build_acl
+    reload_nginx || exit 1
+}
+
+cmd_deny() {
+    [ $# -gt 0 ] || { red "用法: $0 deny <域名>..."; exit 1; }
+    local d
+    touch "$ACL_LIST"
+    for d in "$@"; do
+        if grep -qx "$d" "$ACL_LIST" 2>/dev/null; then
+            grep -vxF "$d" "$ACL_LIST" > "$ACL_LIST.tmp" && mv "$ACL_LIST.tmp" "$ACL_LIST"
+            grn "已撤销: $d"
+        else
+            ylw "不在白名单: $d"
+        fi
+    done
+    build_acl
+    reload_nginx || exit 1
+}
+
+cmd_allowlist() {
+    local d
+    d=$(grep -vE '^[[:space:]]*(#|$)' "$ACL_LIST" 2>/dev/null | tr -d ' \r' | sort -u)
+    echo "后台路径 /$ADMIN_PATH 可访问的域名："
+    if [ -z "$d" ]; then
+        echo "  （空）"
+    else
+        printf '%s\n' "$d" | sed 's/^/  /'
+    fi
+}
+
+cmd_reload() {
+    build_acl
+    reload_nginx || exit 1
+}
+
+need_root
+
+case "${1:-}" in
+    init)      shift; cmd_init "$@" ;;
+    add)       shift; need_init; cmd_add "$@" ;;
+    del|rm)    shift; need_init; cmd_del "$@" ;;
+    test)      shift; need_init; cmd_test "$@" ;;
+    list|ls)   need_init; cmd_list ;;
+    allow)     shift; need_init; cmd_allow "$@" ;;
+    deny)      shift; need_init; cmd_deny "$@" ;;
+    allowlist|allowed) need_init; cmd_allowlist ;;
+    reload)    need_init; cmd_reload ;;
+    *)
+        cat <<EOF
+xboard-domain —— XBoard CDN 回源域名与后台访问控制
+
+  域名
+    $0 add <域名> [证书目录名]   添加回源 vhost（默认只开 80）
+    $0 del <域名>                删除
+    $0 list                      列出回源域名与后台权限
+    $0 test <域名>               本机验证
+
+  后台白名单
+    $0 allow <域名>...           允许这些域名访问后台
+    $0 deny <域名>...            撤销
+    $0 allowlist                 列出可访问后台的域名
+    $0 reload                    重新生成 ACL 并 reload
+
+  初始化
+    $0 init <后台路径> [上游]     只需一次
+
+CDN 面板配置：
+  回源地址   源站 IP
+  回源端口   80
+  回源协议   HTTP
+  回源 Host   必须填域名本身，不能填 IP
+EOF
+        ;;
+esac
