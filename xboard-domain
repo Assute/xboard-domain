@@ -43,6 +43,8 @@ ACL_LIST=$DATA_DIR/admin-allow.list
 # ACL 不能放在 $CONF_DIR 下——那个目录被 nginx.conf 用 *.conf 整体 include，
 # 里面的 location 会被当成顶层指令报 "location directive is not allowed here"。
 ACL_CONF=$DATA_DIR/xboard-admin-acl.conf
+# 支付路径强制不缓存，和 ACL 一样走独立 include
+NOCACHE_CONF=$DATA_DIR/xboard-nocache.conf
 BACKUP_DIR=/root/xboard-domain-bak
 NGINX_BIN=/www/server/nginx/sbin/nginx
 
@@ -126,6 +128,38 @@ build_acl() {
     chmod 644 "$ACL_CONF"
 }
 
+build_nocache() {
+    {
+        echo "# 由 xboard-domain 生成于 $(date '+%Y-%m-%d %H:%M:%S')，请勿手改"
+        echo "# 支付接口强制不缓存：改过签名密钥后，避免浏览器/CDN 继续用旧的支付参数。"
+        echo "# 先 hide 掉后端自己发的 Cache-Control/Pragma/Expires 再统一发一份，"
+        echo "# 否则同一个响应里会出现两个 Cache-Control，行为未定义。"
+        echo "location ^~ /api/v1/user/order/ {"
+        echo "    proxy_hide_header Cache-Control;"
+        echo "    proxy_hide_header Pragma;"
+        echo "    proxy_hide_header Expires;"
+        echo
+        echo "    add_header Cache-Control \"no-store, no-cache, must-revalidate, max-age=0\" always;"
+        echo "    add_header Pragma \"no-cache\" always;"
+        echo "    add_header Expires \"0\" always;"
+        echo
+        echo "    proxy_pass http://$UPSTREAM;"
+        echo "    proxy_http_version 1.1;"
+        echo "    proxy_set_header Host              \$host;"
+        echo "    proxy_set_header X-Real-IP         \$remote_addr;"
+        echo "    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+        echo "    proxy_set_header X-Forwarded-Proto \$scheme;"
+        echo "    proxy_set_header Upgrade           \$http_upgrade;"
+        echo "    proxy_set_header Connection        \"upgrade\";"
+        echo "    proxy_connect_timeout 15s;"
+        echo "    proxy_send_timeout    300s;"
+        echo "    proxy_read_timeout    300s;"
+        echo "    proxy_buffering off;"
+        echo "}"
+    } > "$NOCACHE_CONF"
+    chmod 644 "$NOCACHE_CONF"
+}
+
 reload_nginx() {
     if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
         red "nginx 语法检查失败"
@@ -203,12 +237,30 @@ EOF
     UPSTREAM="$upstream"
     ADMIN_PATH="$admin"
     build_acl
+    build_nocache
     echo "已生成 $ACL_CONF"
+    echo "已生成 $NOCACHE_CONF"
 
     local n=0 f
     while read -r f; do
         [ -n "$f" ] || continue
         wire_vhost "$f" && n=$((n+1))
+        # 老 vhost 可能还没挂 nocache
+        if ! grep -qF "$NOCACHE_CONF" "$f"; then
+            python3 - "$f" "$NOCACHE_CONF" <<'PY'
+import re, sys
+path, nc = sys.argv[1], sys.argv[2]
+s = open(path, encoding="utf-8").read()
+if nc in s:
+    sys.exit(0)
+m = re.search(r"^([ \t]*)location \^~ / \{", s, re.MULTILINE)
+if not m:
+    sys.exit(0)
+indent = m.group(1)
+s = s[:m.start()] + indent + "include " + nc + ";\n\n" + s[m.start():]
+open(path, "w", encoding="utf-8", newline="\n").write(s)
+PY
+        fi
     done < <(xboard_vhosts)
 
     echo "已接入 $n 个 vhost"
@@ -258,6 +310,7 @@ $ssl_block
     client_max_body_size 50m;
 
     include $ACL_CONF;
+    include $NOCACHE_CONF;
 
     location ^~ / {
         proxy_pass http://$UPSTREAM;
@@ -568,6 +621,7 @@ cmd_menu() {
 
 cmd_reload() {
     build_acl
+    build_nocache
     reload_nginx || exit 1
 }
 
